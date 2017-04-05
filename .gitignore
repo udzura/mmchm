@@ -31,3 +31,10 @@
 # Debug files
 *.dSYM/
 *.su
+
+# clone
+
+/libseccomp
+/mruby
+
+/momochi
