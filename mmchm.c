@@ -10,14 +10,34 @@
 #include <seccomp.h>
 
 #include <errno.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "sysnames.h"
+
+#define MMCHM_PRTACE_EVENT(status) (((status >> 8) ^ SIGTRAP) >> 8)
+
 static int on_trap(pid_t child) {
   unsigned long msg;
-  ptrace(PTRACE_GETEVENTMSG, child, NULL, &msg);
-  fprintf(stderr, "%5d: message received, %d\n", child, (int)msg);
+  struct user_regs_struct regs;
+  void *data;
+
+  if (ptrace(PTRACE_GETEVENTMSG, child, NULL, &msg) != 0) {
+    perror("ptrace(PTRACE_GETEVENTMSG...");
+    return 2;
+  }
+  if (ptrace(PTRACE_GETREGS, child, NULL, &regs) != 0) {
+    perror("ptrace(PTRACE_GETREGS...");
+    return 2;
+  }
+  fprintf(stderr, "%5d: syscall is: %s(#%d), arg0: %p\n", child,
+          sysnames[(int)regs.orig_rax], (int)regs.orig_rax, (void *)regs.rdi);
+  /* data = (void *)ptrace(PTRACE_PEEKTEXT, child, (void *)regs.rdi, NULL); */
+  /* fprintf(stderr, "%5d: %p\n", child, data); */
+
+  fprintf(stderr, "%5d: custom message received, %d\n", child, (int)msg);
+
   return 0;
 }
 
@@ -33,9 +53,11 @@ static int on_parent(pid_t pid) {
 
   if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)PTRACE_O_TRACESECCOMP) == -1)
     perror("ptrace(PTRACE_SETOPTIONS...");
-  if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1)
-    perror("ptrace(PTRACE_DETACH...");
-  fprintf(stderr, "%5d: tracing start", pid);
+  if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1)
+    perror("ptrace(PTRACE_CONT...");
+  fprintf(stderr, "%5d: tracing start\n", pid);
+
+  sleep(1);
 
   while (1) {
     child = waitpid(-1, &status, WUNTRACED | WCONTINUED);
@@ -45,15 +67,18 @@ static int on_parent(pid_t pid) {
     }
 
     if (WIFEXITED(status)) {
-      fprintf(stderr, "%5d: exited, st:%d\n", child, WEXITSTATUS(status));
+      fprintf(stderr, "%5d: exited, status:%d\n", child, WEXITSTATUS(status));
       break;
     } else if (WIFSIGNALED(status)) {
       fprintf(stderr, "%5d: signaled, sig:%d, core:%s\n", child,
               WTERMSIG(status), (WCOREDUMP(status)) ? "yes" : "no");
       break;
     } else if (WIFSTOPPED(status)) {
-      if (WSTOPSIG(status) == SIGTRAP) {
-        // trap
+      fprintf(stderr, "%5d: got status: event = %04x, signal = %04x.\n", child,
+              MMCHM_PRTACE_EVENT(status), WSTOPSIG(status));
+      if (WSTOPSIG(status) == SIGTRAP &&
+          MMCHM_PRTACE_EVENT(status) == PTRACE_EVENT_SECCOMP) {
+        // trap seccomp event
         result = on_trap(child);
         if (result) {
           fprintf(stderr, "%5d: hook failed.\n", child);
@@ -61,7 +86,7 @@ static int on_parent(pid_t pid) {
         }
       } else {
         // not trap
-        fprintf(stderr, "%5d: stopped, sig:%d\n", child, WSTOPSIG(status));
+        fprintf(stderr, "%5d: stopped, sig:%d skip\n", child, WSTOPSIG(status));
 
         sig = WSTOPSIG(status);
       }
@@ -83,8 +108,21 @@ static int on_parent(pid_t pid) {
 }
 
 int on_child(void) {
-  /* seccomp stuffs */
-  sleep(2);
+  scmp_filter_ctx ctx;
+
+  sleep(1);
+
+  ctx = seccomp_init(SCMP_ACT_ALLOW);
+  /* if (seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(uname), 1, */
+  /*                      SCMP_A0(SCMP_CMP_GE, 0)) != 0) { */
+  if (seccomp_rule_add(ctx, SCMP_ACT_TRACE(2017), SCMP_SYS(uname), 0) != 0) {
+    perror("seccomp_rule_add");
+    return 1;
+  }
+  if (seccomp_load(ctx) != 0) {
+    perror("seccomp_load");
+    return 1;
+  }
 
   execlp("uname", "uname", "-a", (char *)NULL);
   return 127;
